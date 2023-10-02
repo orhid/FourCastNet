@@ -1,0 +1,392 @@
+#!/usr/bin/env lua
+
+-- # load packages
+package.path = '/net/pr2/projects/plgrid/plggorheuro/lua/?.lua;' .. package.path
+local argparse = require 'argparse'
+local sluarm = require 'sluarm'
+
+
+-- # globals
+
+ROOT_PATH = '/net/pr2/projects/plgrid/plggorheuro/fourcast'
+TEMP_PATH = '/net/tscratch/people/plgorhid/fourcast-tmp'
+YAML_CONFIG_PATH = '/src/config/AFNO.yaml'
+PREDICTION_PREFIX = 'stochastic_autoregressive_prediction' -- this should match the name in the inference script
+
+MAX_GPU_MEM_G = 36
+MAX_GPU_MEM = math.floor(36 * (2^10)^3)
+SINGLE_MAP_SIZE = 20 * 720 * 1440 * 4
+PYTHON_PREAMBLE = 'module load Python > /dev/null' .. '\n' .. 'export PYTHONPATH=' .. ROOT_PATH ..'/src:$PYTHONPATH' .. '\n'
+
+-- ## config
+
+WAIT_TIME = 6
+PERTURBATIONS = 2 -- this should match the config/AFNO.yaml file
+MAX_SIMULTANEOUS_JOBS = 16
+
+
+-- # arguments
+
+local parser = argparse()
+   :name "prediction-script"
+   :description "run stochastic prediction using the fourcast model."
+
+parser:argument("length", "amount of time steps to predict."):convert(tonumber)
+parser:option("-h --hour", "starting point for prediction: hour.", "00:00")
+parser:option("-d --day", "starting point for prediction: day.", "1")
+parser:option("-m --month", "starting point for prediction: month.", "1")
+parser:option("-y --year", "starting point for prediction: year.", "2018")
+parser:option("-t --target", "amount of desired ensamble threads at prediction time.", "1000")
+
+local args = parser:parse()
+
+local prepare_slurm_params = function ()
+  local params = {}
+
+  params.partition = 'plgrid-gpu-a100'
+  params.account = 'plgimgwprzybycien-gpu-a100'
+  params.gres = 'gpu:1'
+  params.mem = MAX_GPU_MEM_G .. 'G'
+  params.job_name = 'fourcast'
+  params.time = '0:12:00'
+  params.nodes = '1'
+  params.output = TEMP_PATH .. '/slurm-%x-%j.out'
+  params.error = TEMP_PATH .. '/slurm-%x-%j.err'
+
+  return params
+end
+
+
+-- # helper functions
+
+table.shallow_copy = function (t)
+  local u = {}
+  for k,v in pairs(t) do u[k] = v end
+  return u
+end
+
+table.length = function (t)
+  local length = 0
+  for _,_ in ipairs(t) do
+    length = length + 1
+   end
+   return length
+end
+
+local max_prediction_length = function (perturbations)
+  -- calculate the maximum amount of steps that will fit into a single memory array
+  return math.floor(math.log(MAX_GPU_MEM / SINGLE_MAP_SIZE, perturbations))
+end
+
+local divide_workload = function (length, stp_target, max_run_length)
+  local deficit = length - stp_target
+  if deficit == 0 then
+    return 0, 0
+  end
+
+  for length_of_middle_run=max_run_length,1,-1 do
+    if deficit % length_of_middle_run == 0 and PERTURBATIONS^length_of_middle_run <= MAX_SIMULTANEOUS_JOBS then
+      return deficit / length_of_middle_run, length_of_middle_run
+    end
+  end
+
+  return nil, nil
+end
+
+local stringify_params = function (params)
+  local output = ''
+  for key, value in pairs(params) do
+    output = output .. ' --' .. key .. ' ' .. value
+  end
+  return output
+end
+
+local stringify_date = function (year, month, day, hour)
+  local rnumerals = {i = 1, v = 5, x = 10}
+  local roman
+
+  roman = function (n)
+    local lowest_key
+    local lowest_distance = math.huge
+    for key,value in pairs(rnumerals) do
+      local distance = n - value
+      if math.abs(distance) < math.abs(lowest_distance) or distance == -math.abs(lowest_distance) then
+        lowest_key = key
+        lowest_distance = distance
+      end
+    end
+
+    if lowest_distance == 0 then
+      return lowest_key
+    end
+
+    local romdist = roman(math.abs(lowest_distance))
+    return lowest_distance > 0 and lowest_key .. romdist or romdist .. lowest_key
+  end
+
+  return year .. roman(month) .. day .. 'h' .. string.sub(hour, 1,2)
+end
+
+local steps_to_reach_target = function (target, perturbations)
+  return math.ceil(math.log(target, perturbations))
+end
+
+
+-- # flow functions
+
+-- ## data preparation
+
+-- download new data from online database
+local download_data = function (slurm_params)
+  print('downloading and preparing data')
+
+  local script = ''
+  script = script .. PYTHON_PREAMBLE
+
+  local py_params = { hour=args.hour,
+                      day=args.day,
+                      month=args.month,
+                      year=args.year,
+                      datapath=TEMP_PATH,
+                      filename='data_raw' }
+  script = script .. 'python ' .. ROOT_PATH .. '/src/datafactory/get_pl.py' .. stringify_params(py_params) .. '\n'
+  script = script .. 'python ' .. ROOT_PATH .. '/src/datafactory/get_sfc.py' .. stringify_params(py_params) .. '\n'
+
+  py_params = { datapath=TEMP_PATH, filename='data_raw' }
+  script = script .. 'python ' .. ROOT_PATH .. '/src/datafactory/translate_nc_hdf.py' .. stringify_params(py_params) .. '\n'
+
+  py_params = { yaml_config=ROOT_PATH .. YAML_CONFIG_PATH,
+                config='afno_backbone',
+                data_path_input=TEMP_PATH .. '/data_raw.h5',
+                data_path_output=TEMP_PATH .. '/data_standardized.h5' }
+  script = script .. 'python ' .. ROOT_PATH .. '/src/datafactory/standardize.py' .. stringify_params(py_params) .. '\n'
+
+  local params = table.shallow_copy(slurm_params)
+  params.job_name = 'fourcast-download-data'
+  sluarm.srun('bash -c "' .. script .. '"', params)
+
+  return py_params.data_path_output
+end
+
+--[[ load test data from disk
+local test_data = function ()
+  print('preparing test data')
+
+  os.execute('module load Python > /dev/null')
+  os.execute('export PYTHONPATH=' .. ROOT_PATH ..'/src:$PYTHONPATH')
+
+  local py_params = { hour=args.hour,
+                      day=args.day,
+                      month=args.month,
+                      data_path_output=TEMP_PATH .. '/data_selected.h5' }
+  os.execute('python ' .. ROOT_PATH .. '/src/datafactory/select_test_data.py' .. stringify_params(py_params) .. '\n')
+
+  py_params = { yaml_config=ROOT_PATH .. YAML_CONFIG_PATH,
+                config='afno_backbone',
+                data_path_input=TEMP_PATH .. '/data_selected.h5',
+                data_path_output=TEMP_PATH .. '/data_standardized.h5' }
+  os.execute('python ' .. ROOT_PATH .. '/src/datafactory/standardize.py' .. stringify_params(py_params) .. '\n')
+  return TEMP_PATH .. '/data_standardized.h5'
+end
+--]]
+
+-- ## flow helper functions
+
+local batch_run = function (datapath, length, suffix, slurm_params)
+  local script = ''
+  script = script .. '#!/bin/bash' .. '\n\n'
+  script = script .. PYTHON_PREAMBLE
+  script = script .. 'cd ' .. ROOT_PATH .. '/src' .. '\n'
+
+  local py_params = { yaml_config=ROOT_PATH .. YAML_CONFIG_PATH,
+                      config='afno_backbone',
+                      data_path_input=datapath,
+                      output_dir=TEMP_PATH .. '/',
+                      suffix='_' .. suffix,
+                      prediction_length=length }
+  script = script .. 'python ' .. 'inference/stochastic.py' .. stringify_params(py_params) .. '\n'
+
+  local params = table.shallow_copy(slurm_params)
+  params.job_name = 'fourcast-' .. suffix
+
+  local script_path = TEMP_PATH .. '/script_' .. suffix
+  local f = assert(io.open(script_path, 'w'))
+  f:write(script)
+  f:close()
+  return sluarm.sbatch(script_path, params)
+end
+
+local run_prediction_on_splits = function (splits_datapaths, length, slurm_params)
+  local jids = {}
+  for index, datapath in ipairs(splits_datapaths) do
+    local jid = batch_run(datapath, length, 'split_' .. (index-1), slurm_params)
+    table.insert(jids, tonumber(jid))
+  end
+
+  while true do
+    local n = table.length(jids)
+    if n == 0 then
+      break
+    end
+
+    os.execute('sleep ' .. WAIT_TIME)
+
+    for index, jid in ipairs(jids) do
+      local stat = sluarm.status(jid)
+      if stat == 'COMPLETED' or stat == 'FAILED' then
+        table.remove(jids, index)
+        break
+      end
+    end
+  end
+end
+
+local split_dataset = function(datapath, nof_splits, slurm_params)
+  local script = ''
+  script = script .. PYTHON_PREAMBLE
+
+  local py_params = { data_path_input=datapath,
+                      splits=nof_splits }
+  script = script .. 'python ' .. 'datafactory/split.py' .. stringify_params(py_params) .. '\n'
+
+  local params = table.shallow_copy(slurm_params)
+  params.job_name = 'fourcast-data-split'
+  sluarm.srun('bash -c "' .. script .. '"', params)
+  local splits_datapaths = {}
+  splits_datapaths.prefix = datapath:sub(1,-4)
+  for split=0,nof_splits-1 do
+    table.insert(splits_datapaths, splits_datapaths.prefix .. '_split_' .. split .. '.h5')
+  end
+  return splits_datapaths
+end
+
+local clusterize_dataset = function(splits_datapaths, nof_splits, slurm_params)
+  local script = ''
+  script = script .. PYTHON_PREAMBLE
+
+  local py_params = { data_path_prefix=splits_datapaths.prefix,
+                      data_path_output=splits_datapaths.prefix .. '.h5',
+                      splits=nof_splits }
+  script = script .. 'python ' .. 'datafactory/clusterize.py' .. stringify_params(py_params) .. '\n'
+
+  local params = table.shallow_copy(slurm_params)
+  params.job_name = 'fourcast-data-clusterize'
+  params.mem = math.floor(MAX_GPU_MEM_G * nof_splits*2) .. 'G'
+  sluarm.srun('bash -c "' .. script .. '"', params)
+  return splits_datapaths.prefix .. '.h5'
+end
+
+local collect_dataset = function(splits_datapaths, nof_splits, slurm_params)
+  local script = ''
+  script = script .. PYTHON_PREAMBLE
+
+  local py_params = { data_path_prefix=splits_datapaths.prefix,
+                      data_path_output=splits_datapaths.prefix .. '.h5',
+                      splits=nof_splits }
+  script = script .. 'python ' .. 'datafactory/collect.py' .. stringify_params(py_params) .. '\n'
+
+  local params = table.shallow_copy(slurm_params)
+  params.job_name = 'fourcast-data-collect'
+  params.mem = math.floor(MAX_GPU_MEM_G * nof_splits*2) .. 'G'
+  sluarm.srun('bash -c "' .. script .. '"', params)
+  return splits_datapaths.prefix .. '.h5'
+end
+
+-- ## first pass
+
+local first_run = function (datapath, length, slurm_params)
+  print('running initial prediction')
+
+  local script = ''
+  script = script .. PYTHON_PREAMBLE
+  script = script .. 'cd ' .. ROOT_PATH .. '/src' .. '\n'
+
+  local py_params = { yaml_config=ROOT_PATH .. YAML_CONFIG_PATH,
+                      config='afno_backbone',
+                      data_path_input=datapath,
+                      output_dir=TEMP_PATH .. '/',
+                      -- suffix='',
+                      prediction_length=length }
+  script = script .. 'python ' .. 'inference/stochastic.py' .. stringify_params(py_params) .. '\n'
+
+  local params = table.shallow_copy(slurm_params)
+  params.job_name = 'fourcast-initial-run'
+  sluarm.srun('bash -c "' .. script .. '"', params)
+  return TEMP_PATH .. '/' .. PREDICTION_PREFIX .. '.h5'
+end
+
+-- ## middle passes
+
+local middle_run = function(datapath, length, slurm_params)
+  local splits_datapaths = split_dataset(datapath, math.floor(PERTURBATIONS^length), slurm_params)
+  run_prediction_on_splits(splits_datapaths, length, slurm_params)
+  return clusterize_dataset(splits_datapaths, math.floor(PERTURBATIONS^length), slurm_params)
+end
+
+-- ## last pass
+
+local last_run = function(datapath, length, slurm_params)
+  local splits_datapaths = split_dataset(datapath, math.floor(PERTURBATIONS^length), slurm_params)
+  run_prediction_on_splits(splits_datapaths, length, slurm_params)
+  return collect_dataset(splits_datapaths, math.floor(PERTURBATIONS^length), slurm_params)
+end
+
+
+-- # main
+
+-- ## prepare environment
+print('preparing environment')
+os.execute('rm -rf ' .. TEMP_PATH)
+os.execute('mkdir ' .. TEMP_PATH)
+local slurm_params = prepare_slurm_params()
+local max_run_length = max_prediction_length(PERTURBATIONS)
+local stp_target = steps_to_reach_target(args.target, PERTURBATIONS)
+
+if stp_target > 2 * max_run_length or PERTURBATIONS^(stp_target-max_run_length) > MAX_SIMULTANEOUS_JOBS then
+  print("ensamble target unreachable due to memory or scheduler constraints. aborting...")
+  goto cleanup
+end
+
+if stp_target > args.length then
+  print("ensamble target unreachable due to insufficient prediction length. reducing target to: " .. PERTURBATIONS^args.length)
+  stp_target = args.length
+end
+
+-- ## prepare data
+do
+  print('downloading data')
+  local datapath = download_data(slurm_params)
+  -- local datapath = test_data()
+
+  -- ## run predictions
+  print('running prediction...')
+  local length_of_first_run = math.min(args.length, max_run_length)
+
+  print('beginning initial run')
+  datapath = first_run(datapath, length_of_first_run, slurm_params)
+
+  do
+    local number_of_middle_runs, length_of_middle_run = divide_workload(args.length, stp_target)
+    if length_of_first_run == args.length then
+      goto save
+    end
+
+    for _=1, number_of_middle_runs do
+      datapath = middle_run(datapath, length_of_middle_run, slurm_params)
+    end
+  end
+
+  print('beginning final run')
+  datapath = last_run(datapath, stp_target - length_of_first_run, slurm_params)
+
+  -- ## cleanup
+  ::save::
+  print('saving prediction')
+  local output_filename = PREDICTION_PREFIX .. '_' .. stringify_date(args.year, args.month, args.day, args.hour) .. '+' .. args.length .. '.h5'
+  os.execute('cp ' .. datapath .. ' ' .. ROOT_PATH .. '/bounce/' .. output_filename)
+end
+
+::cleanup::
+print('cleaning up')
+-- os.execute('rm -rf ' .. TEMP_PATH)
+print('done !')

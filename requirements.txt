@@ -1,12 +1,17 @@
 numpy
+scipy
 torch
 torchvision
 matplotlib
 
+gudhi
+
 mpi4py
+cdsapi
+netCDF4
 h5py
 wandb
-ruamel.yamls
+ruamel.yaml
 tqdm
 timm
 einops
